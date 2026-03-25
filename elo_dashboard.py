@@ -2,17 +2,16 @@ import streamlit as st
 import pandas as pd
 import math
 import os
+import requests
 
 st.set_page_config(page_title="Speedcubing Grandmaster Elo", page_icon="🧊", layout="wide")
 
 RANKS_TSV   = "WCA_333_RanksAverage.tsv"
 PERSONS_TSV = "WCA_Persons.tsv"
 PEAKS_CSV   = "peaks.csv"
+WCA_API     = "https://www.worldcubeassociation.org/api/v0"
 
 # ── Elo formula ────────────────────────────────────────────────────────────────
-# Sub 60s:  Elo = 2850 - 1062 * log10(t / wr)  → WR=2850, 6.60s=2600
-# 60s+:     Elo = 500  - 400  * log10(t / 60)  → 60s=500, last place~100
-
 def calc_elo(avg_s, wr_s):
     if avg_s <= 0 or wr_s <= 0:
         return 0.0
@@ -53,37 +52,23 @@ def title_rank(short):
 # ── Load TSV files ─────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner="Loading WCA data...")
 def load_data():
-    # Read ranks — strip any quotes from column names PowerShell may have added
     ranks_df = pd.read_csv(RANKS_TSV, sep="\t", dtype=str)
-    ranks_df.columns = [c.strip().strip('"').strip("'") for c in ranks_df.columns]
-
-    # Normalise to expected column names regardless of case
-    ranks_df.columns = [c.lower() for c in ranks_df.columns]
+    ranks_df.columns = [c.strip().strip('"').strip("'").lower() for c in ranks_df.columns]
     ranks_df = ranks_df.rename(columns={
-        "personid":      "person_id",
-        "eventid":       "event_id",
-        "worldrank":     "world_rank",
-        "continentrank": "continent_rank",
-        "countryrank":   "country_rank",
+        "personid": "person_id", "eventid": "event_id",
+        "worldrank": "world_rank", "continentrank": "continent_rank", "countryrank": "country_rank",
     })
-
     ranks_df = ranks_df[ranks_df["event_id"] == "333"].copy()
     ranks_df["best"]       = pd.to_numeric(ranks_df["best"],       errors="coerce")
     ranks_df["world_rank"] = pd.to_numeric(ranks_df["world_rank"], errors="coerce")
     ranks_df = ranks_df.dropna(subset=["best","world_rank"])
 
-    # Read persons
     persons_df = pd.read_csv(PERSONS_TSV, sep="\t", dtype=str)
-    persons_df.columns = [c.strip().strip('"').strip("'") for c in persons_df.columns]
-    persons_df.columns = [c.lower() for c in persons_df.columns]
+    persons_df.columns = [c.strip().strip('"').strip("'").lower() for c in persons_df.columns]
     persons_df = persons_df.rename(columns={
-        "wcaid":     "wca_id",
-        "subid":     "sub_id",
-        "countryid": "country_id",
+        "wcaid": "wca_id", "subid": "sub_id", "countryid": "country_id",
     })
-
-    persons_df = persons_df[persons_df["sub_id"].astype(str).str.strip() == "1"]
-    persons_df = persons_df[["wca_id","name","country_id"]]
+    persons_df = persons_df[persons_df["sub_id"].astype(str).str.strip() == "1"][["wca_id","name","country_id"]]
 
     df = ranks_df.merge(persons_df, left_on="person_id", right_on="wca_id", how="left")
     df = df.sort_values("world_rank").reset_index(drop=True)
@@ -112,6 +97,61 @@ def apply_peak_protection(df, peaks_df):
     df.loc[upgrade_elo,   "peak_elo"]   = df.loc[upgrade_elo,   "elo"]
     df.loc[upgrade_title, "peak_title"] = df.loc[upgrade_title, "title_short"]
     return df
+
+
+# ── WCA API — fetch last 5 competition averages for a person ──────────────────
+@st.cache_data(show_spinner="Fetching live results from WCA...", ttl=3600)
+def fetch_recent_form(wca_id, wr_s):
+    try:
+        url = f"{WCA_API}/persons/{wca_id}"
+        resp = requests.get(url, timeout=10)
+        if resp.status_code != 200:
+            return None, "Could not fetch data from WCA API."
+
+        data = resp.json()
+        # results is a dict keyed by competition_id
+        results = data.get("person", {}).get("results", {})
+
+        # Collect all 333 averages across all competitions
+        averages = []
+        for comp_id, events in results.items():
+            if "333" in events:
+                for round_result in events["333"]:
+                    avg = round_result.get("average", 0)
+                    if avg and avg > 0:  # skip DNF (-1) and DNS (-2)
+                        averages.append({
+                            "competition": comp_id,
+                            "average_cs": avg,
+                            "average_s": avg / 100,
+                        })
+
+        if not averages:
+            return None, "No valid 3x3 averages found."
+
+        # Sort by most recent — competition IDs are not dated but we can sort alphabetically
+        # as a proxy; WCA comp IDs tend to end in the year
+        averages_df = pd.DataFrame(averages)
+
+        # Take last 5 unique competitions
+        last_5_comps = averages_df["competition"].unique()[-5:]
+        recent = averages_df[averages_df["competition"].isin(last_5_comps)]
+
+        # Best average across those 5 competitions
+        best_recent_cs = recent["average_cs"].min()
+        best_recent_s  = best_recent_cs / 100
+        form_elo       = calc_elo(best_recent_s, wr_s)
+
+        return {
+            "best_recent_s":  best_recent_s,
+            "best_recent_cs": best_recent_cs,
+            "form_elo":       form_elo,
+            "form_title":     get_title(form_elo),
+            "comps_used":     len(last_5_comps),
+            "recent_df":      recent[["competition","average_cs"]].copy(),
+        }, None
+
+    except Exception as e:
+        return None, f"API error: {str(e)}"
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -152,19 +192,29 @@ st.divider()
 
 tab1, tab2, tab3, tab4 = st.tabs(["🏆 Leaderboard", "🔍 WCA ID Lookup", "🎚️ What-If Simulator", "📊 Title Distribution"])
 
+# ── Tab 1: Leaderboard ─────────────────────────────────────────────────────────
 with tab1:
-    search = st.text_input("Search by name or WCA ID", placeholder="e.g. Feliks or 2009ZEMD01")
+    search = st.text_input("Search by name or WCA ID", placeholder="Search to expand beyond top 100…")
     view = df[["world_rank","name","person_id","country_id","time_fmt","display_elo","display_title"]].copy()
     view.columns = ["World Rank","Name","WCA ID","Country","Average","Elo","Title"]
     view["Elo"] = view["Elo"].round(0).astype(int)
+
     if search:
+        # Search shows up to 200 matching results
         mask = (
             view["Name"].str.contains(search, case=False, na=False) |
             view["WCA ID"].str.contains(search, case=False, na=False)
         )
-        view = view[mask]
-    st.dataframe(view.head(10000), use_container_width=True, hide_index=True)
+        result = view[mask].head(200)
+        st.caption(f"{len(result)} result(s) found.")
+    else:
+        # Default: top 100 only
+        result = view.head(100)
+        st.caption("Showing top 100. Use the search box to find any competitor.")
 
+    st.dataframe(result, use_container_width=True, hide_index=True)
+
+# ── Tab 2: WCA ID Lookup with live form ────────────────────────────────────────
 with tab2:
     wca_id = st.text_input("Enter WCA ID", placeholder="e.g. 2009ZEMD01").strip().upper()
     if wca_id:
@@ -174,16 +224,47 @@ with tab2:
         else:
             r = row.iloc[0]
             title_full, _ = get_title(r["display_elo"])
+
             st.subheader(r.get("name", wca_id))
             st.caption(str(wca_id) + " · " + str(r.get("country_id","—")))
+
+            # All-time stats
+            st.markdown("**All-time rating**")
             a, b, c, d = st.columns(4)
             a.metric("Elo Rating",  f"{r['display_elo']:.0f}")
             b.metric("World Rank",  f"#{int(r['world_rank']):,}")
             c.metric("3x3 Average", fmt_time(int(r["best"])))
             d.metric("Title",       r["display_title"] + " — " + title_full)
+
             if r["peak_title"] != r["title_short"]:
                 st.info("🛡️ Title protected — this player earned a higher title in a previous dataset.")
 
+            st.divider()
+
+            # Live current form from WCA API
+            st.markdown("**Current form** *(last 5 competitions via WCA API)*")
+            form, err = fetch_recent_form(wca_id, wr_s)
+
+            if err:
+                st.warning(f"Could not load current form: {err}")
+            else:
+                form_title_full, form_title_short = form["form_title"]
+                f1, f2, f3, f4 = st.columns(4)
+                f1.metric("Form Elo",       f"{form['form_elo']:.0f}",
+                          delta=f"{form['form_elo'] - r['display_elo']:.0f} vs all-time")
+                f2.metric("Best Recent Avg", fmt_time(int(form["best_recent_cs"])))
+                f3.metric("Form Title",     form_title_short + " — " + form_title_full)
+                f4.metric("Comps sampled",  str(form["comps_used"]))
+
+                # Show recent averages table
+                recent = form["recent_df"].copy()
+                recent["average"] = recent["average_cs"].apply(fmt_time)
+                recent["elo"]     = recent["average_cs"].apply(lambda x: round(calc_elo(x/100, wr_s)))
+                recent = recent[["competition","average","elo"]]
+                recent.columns = ["Competition","Average","Elo"]
+                st.dataframe(recent, use_container_width=True, hide_index=True)
+
+# ── Tab 3: What-If Simulator ───────────────────────────────────────────────────
 with tab3:
     st.caption("Drag to simulate a hypothetical new world record.")
     hyp_s = st.slider("Hypothetical World Record (seconds)", min_value=2.50, max_value=6.00,
@@ -197,6 +278,7 @@ with tab3:
     out["New Elo"] = out["New Elo"].round(0).astype(int)
     st.dataframe(out, use_container_width=True, hide_index=True)
 
+# ── Tab 4: Title Distribution ──────────────────────────────────────────────────
 with tab4:
     st.caption("Title counts based on peak (protected) titles.")
     title_order = ["GM","IM","FM","CM","A","B","C","D"]
